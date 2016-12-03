@@ -13,7 +13,6 @@
 #include <math.h>
 #include <sunMoon.h>
 #include <WlessOregonV2.h>
-#include <CommonControls.h>
 
 #define DHT_PIN        4
 #define DHTTYPE    DHT22
@@ -228,6 +227,305 @@ void CONFIG::defaultConfig(void) {
   Config.ext_sensor_ID     =   0;                       // 0 means - any sensor
   Config.backlight_morning =  48;                       // 8:00
   Config.backlight_evening = 138;                       // 23:00
+}
+
+//------------------------------------------ backlight of the LCD display (lite version) ----------------------
+class BL {
+  public:
+    BL(byte sensorPIN, byte lightPIN, byte start_brightness = 128) {
+      sensor_pin          = sensorPIN;
+      led_pin             = lightPIN;
+      default_brightness  = start_brightness;
+      b_night             =  50;
+      daily_brightness    = 150;
+      b_day               = 500;
+    }
+    void init(void);                                // Initialize the data
+    void adjust(void);                              // Automatically adjust the brightness
+    int  getSensorValue(void)                       { return analogRead(sensor_pin); }
+    void setBrightness(byte b);
+    void turnAuto(bool a);
+    void setLimits(uint16_t dark, uint16_t daylight, byte br_nightly, byte br_daily);
+    void setNightPeriod(byte Evening, byte Morning);
+    bool isDark(void);                              // Whether it is night time or it is dark here
+  private:
+    int      empAverage(int v);                     // Exponential average value
+    byte     sensor_pin;                            // Light sensor pin
+    byte     led_pin;                               // Led PWM pin
+    uint32_t checkMS;                               // Time in ms when the sensor was checked
+    uint32_t ch_step;                               // The time in ms when the brighthess can be adjusted
+    bool     automatic;                             // Whether the backlight should be adjusted automatically
+    bool     use_local_time;                        // Whether to use local time to switch off the light nightly
+    byte     brightness;                            // The backlight brightness
+    byte     new_brightness;                        // The baclight brightness to set up
+    byte     evening, morning;                      // The time of evening and morning (in 10-minutes interval)
+    long     emp;                                   // Exponential average value
+    byte     default_brightness;                    // Default brightness of backlight
+    uint16_t b_night;                               // light sensor value of the night
+    uint16_t b_day;                                 // light sensor value of the day light
+    byte     daily_brightness;                      // The maximum brightness of backlight when light between b_night and b_day
+    byte     nightly_brightness;                    // The brightness to use nightly
+    const byte     emp_k = 8;                       // The exponential average coefficient
+    const uint16_t period  = 200;                   // The period in ms to check the photeregister
+    const uint16_t ch_period = 5;                   // The period to adjust brightness
+};
+
+void BL::init(void) {
+
+  pinMode(led_pin, OUTPUT);
+  pinMode(sensor_pin, INPUT);
+  int light = analogRead(sensor_pin);
+  emp = 0;
+  brightness = new_brightness = default_brightness;
+  checkMS = ch_step = 0;
+  use_local_time = false;
+  automatic = true;
+  nightly_brightness = 50;
+  evening = morning = 0;                            // This value will be overwritten by config
+  adjust();
+}
+
+int BL::empAverage(int v) {
+  long nv = v *emp_k;
+  int round_v = emp_k >> 1;
+  emp += (nv - emp + round_v) / emp_k;
+  int r = (emp + round_v) / emp_k;
+  return r;
+}
+  
+void BL::adjust(void) {
+
+  if (!automatic) return;
+  
+  uint32_t ms = millis();
+  if ((ms > ch_step) && (new_brightness != brightness)) {
+    if (new_brightness > brightness) ++brightness; else --brightness;
+    analogWrite(led_pin, brightness);
+    ch_step = ms + ch_period;
+  }
+
+  if (ms < checkMS) return;
+  checkMS = ms + period;
+
+  // Turn off the backlight at night
+  if (isDark()) {
+    new_brightness = nightly_brightness;
+    return;
+  }
+  
+  int light = analogRead(sensor_pin);
+
+  light = empAverage(light);
+  if (light < b_night) {
+    new_brightness = nightly_brightness;
+    return;
+  }
+
+  if (light > b_day) {
+    new_brightness = 0;
+    return;
+  }
+
+  new_brightness = map(light, b_night, b_day, nightly_brightness, daily_brightness);
+}
+
+void BL::setBrightness(byte b) {
+  brightness = b;
+  automatic = false;
+  analogWrite(led_pin, brightness);
+}
+
+void BL::turnAuto(bool a) {
+  automatic = a;
+  checkMS = 0;
+  if (a) adjust();    
+}
+
+void BL::setLimits(uint16_t dark, uint16_t daylight, byte br_nightly, byte br_daily) {
+  b_night             = dark;
+  b_day               = daylight;
+  daily_brightness    = br_daily;
+  nightly_brightness  = br_nightly;
+}
+
+void BL::setNightPeriod(byte Evening, byte Morning) { // Time in 10-minute intervals from midnight
+  if (Evening <= Morning) return;
+  if (Evening > 144)    return;
+  morning = Morning;
+  evening = Evening;
+  use_local_time = true;
+}
+
+bool BL::isDark(void) {
+
+  if (use_local_time) {
+    byte now_t = hour() * 6 + (minute() + 5) /10; // Time in 10-minute intervals from midnight
+    return ((now_t <= morning) || (now_t >= evening));
+  }
+
+  long light = 0;
+  for (byte i = 0; i < 4; ++i) {
+    light += analogRead(sensor_pin);
+    delay(20);
+  }
+  light >>= 2;
+  return (light < b_night);
+}
+
+//------------------------------------------ class BUTTON ------------------------------------------------------
+class BUTTON {
+  public:
+    BUTTON(byte ButtonPIN, unsigned int timeout_ms = 3000) {
+      pt = tickTime = 0;
+      buttonPIN = ButtonPIN;
+      overPress = timeout_ms;
+    }
+    void init(void) { pinMode(buttonPIN, INPUT_PULLUP); }
+    void setTimeout(uint16_t timeout_ms = 3000)    { overPress = timeout_ms; }
+    byte intButtonStatus(void)                     { byte m = mode; mode = 0; return m; }
+    void cnangeINTR(void);
+    byte buttonCheck(void);
+    bool buttonTick(void);
+  private:
+    volatile byte     mode;                         // The button mode: 0 - not pressed, 1 - pressed, 2 - long pressed
+    uint16_t          overPress;                    // Maxumum time in ms the button can be pressed
+    volatile uint32_t pt;                           // Time in ms when the button was pressed (press time)
+    uint32_t          tickTime;                     // The time in ms when the button Tick was set
+    byte              buttonPIN;                    // The pin number connected to the button
+    const uint16_t    tickTimeout = 200;            // Period of button tick, while tha button is pressed 
+    const uint16_t    shortPress = 900;             // If the button was pressed less that this timeout, we assume the short button press
+};
+
+void BUTTON::cnangeINTR(void) {                     // Interrupt function, called when the button status changed
+  
+  bool keyUp = digitalRead(buttonPIN);
+  unsigned long now_t = millis();
+  if (!keyUp) {                                     // The button has been pressed
+    if ((pt == 0) || (now_t - pt > overPress)) pt = now_t; 
+  } else {
+    if (pt > 0) {
+      if ((now_t - pt) < shortPress) mode = 1;      // short press
+        else mode = 2;                              // long press
+      pt = 0;
+    }
+  }
+}
+
+byte BUTTON::buttonCheck(void) {                    // Check the button state, called each time in the main loop
+
+  mode = 0;
+  bool keyUp = digitalRead(buttonPIN);              // Read the current state of the button
+  uint32_t now_t = millis();
+  if (!keyUp) {                                     // The button is pressed
+    if ((pt == 0) || (now_t - pt > overPress)) pt = now_t;
+  } else {
+    if (pt == 0) return 0;
+    if ((now_t - pt) > shortPress)                  // Long press
+      mode = 2;
+    else
+      mode = 1;
+    pt = 0;
+  } 
+  return mode;
+}
+
+bool BUTTON::buttonTick(void) {                     // When the button pressed for a while, generate periodical ticks
+
+  bool keyUp = digitalRead(buttonPIN);              // Read the current state of the button
+  uint32_t now_t = millis();
+  if (!keyUp && (now_t - pt > shortPress)) {        // The button have been pressed for a while
+    if (now_t - tickTime > tickTimeout) {
+       tickTime = now_t;
+       return (pt != 0);
+    }
+  } else {
+    if (pt == 0) return false;
+    tickTime = 0;
+  } 
+  return false;
+}
+
+//------------------------------------------ class ENCODER ------------------------------------------------------
+class ENCODER {
+  public:
+    ENCODER(byte aPIN, byte bPIN, int16_t initPos = 0) {
+      pt = 0; mPIN = aPIN; sPIN = bPIN; pos = initPos;
+      min_pos = -32767; max_pos = 32766; channelB = false; increment = 1;
+      changed = 0;
+      is_looped = false;
+    }
+    void init(void) {
+      pinMode(mPIN, INPUT_PULLUP);
+      pinMode(sPIN, INPUT_PULLUP);
+    }
+    void    set_increment(byte inc)             { increment = inc; }
+    byte    get_increment(void)                 { return increment; }
+    int16_t read(void)                          { return pos; }
+    void    reset(int16_t initPos, int16_t low, int16_t upp, byte inc = 1, byte fast_inc = 0, bool looped = false);
+    bool    write(int16_t initPos);
+    void    cnangeINTR(void);
+  private:
+    int32_t           min_pos, max_pos;
+    volatile uint32_t pt;                           // Time in ms when the encoder was rotaded
+    volatile uint32_t changed;                      // Time in ms when the value was changed
+    volatile bool     channelB;
+    volatile int16_t  pos;                          // Encoder current position
+    byte              mPIN, sPIN;                   // The pin numbers connected to the main channel and to the socondary channel
+    bool              is_looped;                    // Whether the encoder is looped
+    byte              increment;                    // The value to add or substract for each encoder tick
+    byte              fast_increment;               // The value to change encoder when in runs quickly
+    const uint16_t    fast_timeout = 300;           // Time in ms to change encodeq quickly
+    const uint16_t    overPress = 1000;
+};
+
+bool ENCODER::write(int16_t initPos) {
+  if ((initPos >= min_pos) && (initPos <= max_pos)) {
+    pos = initPos;
+    return true;
+  }
+  return false;
+}
+
+void ENCODER::reset(int16_t initPos, int16_t low, int16_t upp, byte inc, byte fast_inc, bool looped) {
+  min_pos = low; max_pos = upp;
+  if (!write(initPos)) initPos = min_pos;
+  increment = fast_increment = inc;
+  if (fast_inc > increment) fast_increment = fast_inc;
+  is_looped = looped;
+}
+
+void ENCODER::cnangeINTR(void) {                    // Interrupt function, called when the channel A of encoder changed
+  
+  bool rUp = digitalRead(mPIN);
+  unsigned long now_t = millis();
+  if (!rUp) {                                       // The channel A has been "pressed"
+    if ((pt == 0) || (now_t - pt > overPress)) {
+      pt = now_t;
+      channelB = digitalRead(sPIN);
+    }
+  } else {
+    if (pt > 0) {
+      byte inc = increment;
+      if ((now_t - pt) < overPress) {
+        if ((now_t - changed) < fast_timeout) inc = fast_increment;
+        changed = now_t;
+        if (channelB) pos -= inc; else pos += inc;
+        if (pos > max_pos) { 
+          if (is_looped)
+            pos = min_pos;
+          else 
+            pos = max_pos;
+        }
+        if (pos < min_pos) {
+          if (is_looped)
+            pos = max_pos;
+          else
+            pos = min_pos;
+        }
+      }
+      pt = 0; 
+    }
+  }
 }
 
 //------------------------------------------ class clockArm ------------------------------------------------------
