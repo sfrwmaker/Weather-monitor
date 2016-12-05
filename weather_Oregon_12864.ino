@@ -37,6 +37,7 @@ const byte R_SECD_PIN =  5;                     // Rotary Encoder second pin (le
 const byte R_BUTN_PIN =  3;                     // Rotary Encoder push button pin
 
 #define SD_PIN          53                      // SD card reader select pin
+#define HB_PIN          A2                      // The pin for heartBeat reset
 
 #define OUR_latitude    55.751244
 #define OUR_longtitude  37.618423
@@ -228,6 +229,38 @@ void CONFIG::defaultConfig(void) {
   Config.backlight_morning =  48;                       // 8:00
   Config.backlight_evening = 138;                       // 23:00
 }
+
+//------------------------------------------ Heart beat class (Watch dog timer based on ne555 IC) --------------
+class HB {
+  public:
+    HB(byte hb) {
+      hb_pin = hb;
+      pinMode(hb_pin, INPUT);
+      period = 0;                                   // auto reset is disabled
+      next_reset = 0;
+    }
+    void reset(void) {
+      pinMode(hb_pin, OUTPUT);
+      digitalWrite(hb_pin, LOW);                    // reset ne555 timer
+      delay(200);
+      pinMode(hb_pin, INPUT);
+    }
+    void setTimeout(uint16_t to = 0)                { period = to; }
+    void autoReset(void) {
+      if (period == 0) {                            // Automatic reset is disabled, reset now
+        reset();
+        return;
+      }
+      if (millis() > next_reset) {
+        reset();
+        next_reset = millis() + (long)period * 1000; 
+      }
+    }
+  private:
+    byte     hb_pin;                                // ne555 reset pin (heart beat)
+    uint16_t period;                                // The period to reset the ne555 in seconds
+    uint32_t next_reset;                            // time in ms to automatically reset the ne555
+};
 
 //------------------------------------------ backlight of the LCD display (lite version) ----------------------
 class BL {
@@ -2282,6 +2315,7 @@ void sunSCREEN::show(void) {
 // ================================ End of all class definitions ======================================
 DSPL                    u8g(EN_SCK_PIN, RW_MOSI_PIN, RS_CS_PIN, RST_PIN);
 BL                      bckLight(LIGHT_SENSOR, LCD_BLGHT_PIN);
+HB                      hb(HB_PIN);
 CONFIG                  stationCfg;
 Adafruit_BMP085_Unified bmp = Adafruit_BMP085_Unified(10085);
 DHT                     dht(DHT_PIN, DHTTYPE);
@@ -2351,6 +2385,7 @@ void setup() {
 
   bckLight.init();
   bckLight.setLimits(50, 500, 1, 150);
+  hb.setTimeout(60);                                  // Reset ne555 timer every minute
   
   // Load configuration data
   stationCfg.init();
@@ -2388,6 +2423,7 @@ void loop() {
  static time_t   write_log = 0;
 
   bckLight.adjust();
+  hb.autoReset();
 
   SCREEN* nxt = pScreen->returnToMain();
   if (nxt != pScreen) {                               // return to the main screen by timeout
